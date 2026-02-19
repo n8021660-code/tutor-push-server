@@ -88,22 +88,3 @@ app.post("/send", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log("Server started on port", PORT));
-
-        await doc.ref.update({
-          sent: true,
-          error: null,
-          sentAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        console.log("Push sent:", doc.id, "tokens:", tokens.length);
-      } catch (e) {
-        console.error("Push error:", e);
-        await doc.ref.update({
-          sent: false,
-          error: String(e),
-        });
-      }
-    }
-  });
-
-app.listen(PORT, () => console.log("Server started on port", PORT));
