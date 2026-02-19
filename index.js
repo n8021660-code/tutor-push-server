@@ -29,7 +29,7 @@ function chunk(arr, size) {
   return res;
 }
 
-app.get("/", (req, res) => res.send("Tutor Push Server running"));
+app.get("/", (req, res) => res.send("Tutor Push Server running v2"));
 
 async function sendToUserIds({ toUserIds, title, body, data }) {
   const userRefs = toUserIds.map((uid) => db.collection("users").doc(uid));
