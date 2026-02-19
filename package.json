@@ -3,9 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "main": "index.js",
-  "engines": { "node": "18" },
+  "engines": {
+    "node": "18"
+  },
   "dependencies": {
-    "express": "^4.19.2",
+    "express": "^4.22.1",
     "firebase-admin": "^12.3.0"
   }
 }
