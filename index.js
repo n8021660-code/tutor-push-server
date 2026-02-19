@@ -6,6 +6,9 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
+// 🔐 Простой ключ доступа для /send (задашь в Render Env)
+const API_KEY = (process.env.PUSH_API_KEY || "").trim();
+
 function loadServiceAccount() {
   const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64;
   if (b64 && b64.trim().length > 0) {
@@ -16,7 +19,9 @@ function loadServiceAccount() {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   if (raw && raw.trim().length > 0) return JSON.parse(raw);
 
-  throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_JSON_B64 or FIREBASE_SERVICE_ACCOUNT_JSON");
+  throw new Error(
+    "Missing FIREBASE_SERVICE_ACCOUNT_JSON_B64 or FIREBASE_SERVICE_ACCOUNT_JSON"
+  );
 }
 
 const serviceAccount = loadServiceAccount();
@@ -34,43 +39,10 @@ function chunk(arr, size) {
 }
 
 app.get("/", (req, res) => {
-  res.send(`Tutor Push Server running v4 (project_id=${serviceAccount.project_id})`);
+  res.send(`Tutor Push Server v5 (project_id=${serviceAccount.project_id})`);
 });
 
-// ✅ Диагностика: что сервер видит в users/{uid}
-app.get("/debug/user/:uid", async (req, res) => {
-  try {
-    const uid = req.params.uid;
-    const snap = await db.collection("users").doc(uid).get();
-
-    if (!snap.exists) {
-      return res.json({
-        ok: true,
-        exists: false,
-        uid,
-        project_id: serviceAccount.project_id,
-      });
-    }
-
-    const data = snap.data() || {};
-    const fcmTokens = data.fcmTokens && typeof data.fcmTokens === "object" ? data.fcmTokens : {};
-    const tokenKeys = Object.keys(fcmTokens);
-
-    res.json({
-      ok: true,
-      exists: true,
-      uid,
-      project_id: serviceAccount.project_id,
-      fcmTokensKeysCount: tokenKeys.length,
-      fcmTokensKeysFirst30: tokenKeys.slice(0, 30),
-      fcmTokensSample: tokenKeys.slice(0, 5).map((k) => [k, typeof fcmTokens[k], fcmTokens[k]]),
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// ✅ Диагностика: показать несколько user-доков, которые сервер вообще видит
+// ✅ Диагностика: список users
 app.get("/debug/users", async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || "5", 10) || 5, 20);
@@ -87,6 +59,42 @@ app.get("/debug/users", async (req, res) => {
   }
 });
 
+// ✅ Диагностика: один user
+app.get("/debug/user/:uid", async (req, res) => {
+  try {
+    const uid = req.params.uid;
+    const snap = await db.collection("users").doc(uid).get();
+
+    if (!snap.exists) {
+      return res.json({
+        ok: true,
+        exists: false,
+        uid,
+        project_id: serviceAccount.project_id,
+      });
+    }
+
+    const data = snap.data() || {};
+    const fcmTokens =
+      data.fcmTokens && typeof data.fcmTokens === "object" ? data.fcmTokens : {};
+    const tokenKeys = Object.keys(fcmTokens);
+
+    res.json({
+      ok: true,
+      exists: true,
+      uid,
+      project_id: serviceAccount.project_id,
+      fcmTokensKeysCount: tokenKeys.length,
+      fcmTokensKeysFirst10: tokenKeys.slice(0, 10),
+      fcmTokensSample: tokenKeys
+        .slice(0, 3)
+        .map((k) => [k, typeof fcmTokens[k], fcmTokens[k]]),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
 async function sendToUserIds({ toUserIds, title, body, data }) {
   const userRefs = toUserIds.map((uid) => db.collection("users").doc(uid));
   const userSnaps = await db.getAll(...userRefs);
@@ -95,7 +103,8 @@ async function sendToUserIds({ toUserIds, title, body, data }) {
   for (const us of userSnaps) {
     if (!us.exists) continue;
     const ud = us.data() || {};
-    const fcmTokens = ud.fcmTokens && typeof ud.fcmTokens === "object" ? ud.fcmTokens : {};
+    const fcmTokens =
+      ud.fcmTokens && typeof ud.fcmTokens === "object" ? ud.fcmTokens : {};
     tokens.push(...Object.keys(fcmTokens));
   }
 
@@ -106,8 +115,13 @@ async function sendToUserIds({ toUserIds, title, body, data }) {
   }
 
   const payload = {
-    notification: { title: String(title || "Уведомление"), body: String(body || "") },
-    data: Object.fromEntries(Object.entries(data || {}).map(([k, v]) => [String(k), String(v)])),
+    notification: {
+      title: String(title || "Уведомление"),
+      body: String(body || ""),
+    },
+    data: Object.fromEntries(
+      Object.entries(data || {}).map(([k, v]) => [String(k), String(v)])
+    ),
   };
 
   const batches = chunk(tokens, 500);
@@ -126,16 +140,31 @@ async function sendToUserIds({ toUserIds, title, body, data }) {
   return { ok: true, tokens: tokens.length, success, failure };
 }
 
-// ✅ Ручная отправка пуша:
-// POST /send { toUserIds: ["UID"], title, body, data }
-app.post("/send", async (req, res) => {
-  try {
-    const toUserIds = Array.isArray(req.body?.toUserIds) ? req.body.toUserIds : [];
-    const title = req.body?.title || "Тест";
-    const body = req.body?.body || "Проверка";
-    const data = req.body?.data && typeof req.body.data === "object" ? req.body.data : {};
+// 🔐 middleware: проверка ключа
+function requireApiKey(req, res, next) {
+  if (!API_KEY) return next(); // если ключ не задан — не блокируем (на время теста)
+  const got = (req.header("x-api-key") || "").trim();
+  if (!got || got !== API_KEY) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  next();
+}
 
-    if (toUserIds.length === 0) return res.status(400).json({ ok: false, error: "no_toUserIds" });
+// ✅ Основной endpoint: Flutter будет дёргать его при действиях
+// POST /send  body: { toUserIds: ["uid"], title, body, data }
+app.post("/send", requireApiKey, async (req, res) => {
+  try {
+    const toUserIds = Array.isArray(req.body?.toUserIds)
+      ? req.body.toUserIds
+      : [];
+    const title = req.body?.title || "Уведомление";
+    const body = req.body?.body || "";
+    const data =
+      req.body?.data && typeof req.body.data === "object" ? req.body.data : {};
+
+    if (toUserIds.length === 0) {
+      return res.status(400).json({ ok: false, error: "no_toUserIds" });
+    }
 
     const result = await sendToUserIds({ toUserIds, title, body, data });
     res.json(result);
