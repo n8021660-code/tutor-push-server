@@ -17,8 +17,10 @@ function loadServiceAccount() {
   throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_JSON_B64 or FIREBASE_SERVICE_ACCOUNT_JSON");
 }
 
+const serviceAccount = loadServiceAccount();
+
 admin.initializeApp({
-  credential: admin.credential.cert(loadServiceAccount()),
+  credential: admin.credential.cert(serviceAccount),
 });
 
 const db = admin.firestore();
@@ -29,7 +31,35 @@ function chunk(arr, size) {
   return res;
 }
 
-app.get("/", (req, res) => res.send("Tutor Push Server running v2"));
+app.get("/", (req, res) => {
+  res.send(`Tutor Push Server running v3 (project_id=${serviceAccount.project_id})`);
+});
+
+// ✅ Диагностика: показывает, что сервер видит в users/{uid}
+app.get("/debug/user/:uid", async (req, res) => {
+  try {
+    const uid = req.params.uid;
+    const snap = await db.collection("users").doc(uid).get();
+    if (!snap.exists) {
+      return res.json({ ok: true, exists: false, uid, project_id: serviceAccount.project_id });
+    }
+    const data = snap.data() || {};
+    const fcmTokens = data.fcmTokens && typeof data.fcmTokens === "object" ? data.fcmTokens : {};
+    const tokenKeys = Object.keys(fcmTokens);
+    res.json({
+      ok: true,
+      exists: true,
+      uid,
+      project_id: serviceAccount.project_id,
+      fcmTokensKeysCount: tokenKeys.length,
+      fcmTokensKeysFirst30: tokenKeys.slice(0, 30),
+      // покажем тип значений у первых ключей
+      fcmTokensSample: tokenKeys.slice(0, 5).map((k) => [k, typeof fcmTokens[k], fcmTokens[k]]),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
 
 async function sendToUserIds({ toUserIds, title, body, data }) {
   const userRefs = toUserIds.map((uid) => db.collection("users").doc(uid));
@@ -39,7 +69,7 @@ async function sendToUserIds({ toUserIds, title, body, data }) {
   for (const us of userSnaps) {
     if (!us.exists) continue;
     const ud = us.data() || {};
-    const fcmTokens = ud.fcmTokens || {};
+    const fcmTokens = ud.fcmTokens && typeof ud.fcmTokens === "object" ? ud.fcmTokens : {};
     tokens.push(...Object.keys(fcmTokens));
   }
   tokens = [...new Set(tokens)].filter(Boolean);
@@ -69,8 +99,6 @@ async function sendToUserIds({ toUserIds, title, body, data }) {
   return { ok: true, tokens: tokens.length, success, failure };
 }
 
-// ✅ РУЧНОЙ ТЕСТ: отправка пуша по HTTP
-// POST /send { toUserIds: ["UID"], title: "...", body: "...", data: {...} }
 app.post("/send", async (req, res) => {
   try {
     const toUserIds = Array.isArray(req.body?.toUserIds) ? req.body.toUserIds : [];
