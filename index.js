@@ -3,7 +3,69 @@ const express = require("express");
 
 const app = express();
 app.use(express.json());
+// ================= PUSH LISTENER =================
 
+async function sendPushToUsers(userIds, title, body) {
+  const usersSnap = await db.collection('users')
+    .where(admin.firestore.FieldPath.documentId(), 'in', userIds)
+    .get();
+
+  let tokens = [];
+
+  usersSnap.forEach(doc => {
+    const data = doc.data() || {};
+    const fcmTokens = data.fcmTokens || {};
+    tokens.push(...Object.keys(fcmTokens));
+  });
+
+  if (tokens.length === 0) {
+    console.log('❌ No tokens found');
+    return { success: 0 };
+  }
+
+  const message = {
+    notification: { title, body },
+    tokens,
+  };
+
+  const response = await admin.messaging().sendEachForMulticast(message);
+
+  console.log('✅ Push sent:', response.successCount, '/', tokens.length);
+
+  return { success: response.successCount };
+}
+
+db.collection('notifications')
+  .where('sent', '==', false)
+  .onSnapshot(async snapshot => {
+    for (const change of snapshot.docChanges()) {
+      if (change.type !== 'added') continue;
+
+      const doc = change.doc;
+      const data = doc.data();
+
+      console.log('📨 New notification:', doc.id);
+
+      try {
+        const result = await sendPushToUsers(
+          data.toUserIds || [],
+          data.title || '',
+          data.body || ''
+        );
+
+        await doc.ref.update({
+          sent: true,
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+          success: result.success
+        });
+
+      } catch (err) {
+        console.error('🔥 Push error:', err);
+      }
+    }
+  });
+
+console.log('👂 Listening for notifications...');
 const PORT = process.env.PORT || 10000;
 
 // 🔐 Простой ключ доступа для /send (задашь в Render Env)
