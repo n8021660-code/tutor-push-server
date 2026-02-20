@@ -32,7 +32,7 @@ async function sendPushToUsers(userIds, title, body) {
   console.log('✅ Push sent:', response.successCount, '/', tokens.length);
 
   return { success: response.successCount };
-} {
+}
   const usersSnap = await db.collection('users')
     .where(admin.firestore.FieldPath.documentId(), 'in', userIds)
     .get();
