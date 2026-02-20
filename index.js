@@ -6,6 +6,33 @@ app.use(express.json());
 // ================= PUSH LISTENER =================
 
 async function sendPushToUsers(userIds, title, body) {
+  let tokens = [];
+
+  for (const uid of userIds) {
+    const doc = await db.collection('users').doc(uid).get();
+    if (!doc.exists) continue;
+
+    const data = doc.data() || {};
+    const fcmTokens = data.fcmTokens || {};
+    tokens.push(...Object.keys(fcmTokens));
+  }
+
+  if (tokens.length === 0) {
+    console.log('❌ No tokens found');
+    return { success: 0 };
+  }
+
+  const message = {
+    notification: { title, body },
+    tokens,
+  };
+
+  const response = await admin.messaging().sendEachForMulticast(message);
+
+  console.log('✅ Push sent:', response.successCount, '/', tokens.length);
+
+  return { success: response.successCount };
+} {
   const usersSnap = await db.collection('users')
     .where(admin.firestore.FieldPath.documentId(), 'in', userIds)
     .get();
