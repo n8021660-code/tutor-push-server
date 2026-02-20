@@ -1,12 +1,87 @@
-const admin = require("firebase-admin");
-const express = require("express");
+// index.js
+'use strict';
 
+const express = require('express');
+const admin = require('firebase-admin');
+
+// -------------------------
+// Helpers
+// -------------------------
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v || String(v).trim() === '') {
+    throw new Error(`Missing env var: ${name}`);
+  }
+  return v;
+}
+
+function parseAdminUids() {
+  const raw = (process.env.ADMIN_UIDS || '').trim();
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function safeJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch (e) {
+    return null;
+  }
+}
+
+function decodeServiceAccountFromB64(b64) {
+  const jsonStr = Buffer.from(b64, 'base64').toString('utf8');
+  const obj = safeJsonParse(jsonStr);
+  if (!obj) throw new Error('FIREBASE_SERVICE_ACCOUNT_B64 is not valid base64 JSON');
+  return obj;
+}
+
+function isTruthy(v) {
+  return v === true || v === 'true' || v === 1 || v === '1';
+}
+
+// -------------------------
+// Firebase Admin init
+// -------------------------
+const serviceAccountB64 = requireEnv('FIREBASE_SERVICE_ACCOUNT_B64');
+const serviceAccount = decodeServiceAccountFromB64(serviceAccountB64);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const db = admin.firestore();
+const PROJECT_ID = serviceAccount.project_id || '(unknown)';
+
+// -------------------------
+// Express app
+// -------------------------
 const app = express();
-app.use(express.json());
-// ================= PUSH LISTENER =================
+app.use(express.json({ limit: '1mb' }));
 
-async function sendPushToUsers(userIds, title, body) {
-  let tokens = [];
+const ADMIN_UIDS = parseAdminUids();
+const PUSH_API_KEY = (process.env.PUSH_API_KEY || '').trim();
+
+// Optional very simple protection by API key for /send
+function checkApiKey(req) {
+  if (!PUSH_API_KEY) return true; // if not set, allow (dev mode)
+  const headerKey = (req.headers['x-api-key'] || req.headers['X-API-KEY'] || '').toString().trim();
+  return headerKey === PUSH_API_KEY;
+}
+
+function isAdminUid(uid) {
+  if (!uid) return false;
+  return ADMIN_UIDS.includes(uid);
+}
+
+// -------------------------
+// Core: get FCM tokens for uids
+// -------------------------
+async function getTokensForUsers(userIds) {
+  const tokens = [];
 
   for (const uid of userIds) {
     const doc = await db.collection('users').doc(uid).get();
@@ -14,252 +89,231 @@ async function sendPushToUsers(userIds, title, body) {
 
     const data = doc.data() || {};
     const fcmTokens = data.fcmTokens || {};
-    tokens.push(...Object.keys(fcmTokens));
+
+    // support map: { token: true }
+    // also accept { token: {active:true} } or { token: 1 } etc.
+    for (const [token, val] of Object.entries(fcmTokens)) {
+      if (!token || token.length < 10) continue;
+      if (val && typeof val === 'object') {
+        // if stored as object, accept active flag or any object as valid
+        if ('active' in val) {
+          if (isTruthy(val.active)) tokens.push(token);
+        } else {
+          tokens.push(token);
+        }
+      } else {
+        if (isTruthy(val)) tokens.push(token);
+      }
+    }
   }
 
-  if (tokens.length === 0) {
-    console.log('❌ No tokens found');
-    return { success: 0 };
+  // unique
+  return Array.from(new Set(tokens));
+}
+
+// -------------------------
+// Core: send push
+// -------------------------
+async function sendPushToUsers(userIds, title, body, data) {
+  const tokens = await getTokensForUsers(userIds);
+
+  if (!tokens.length) {
+    return { ok: false, error: 'no_tokens', tokens: 0 };
   }
 
   const message = {
-    notification: { title, body },
     tokens,
+    notification: {
+      title: String(title || ''),
+      body: String(body || ''),
+    },
+    data: data && typeof data === 'object' ? Object.fromEntries(
+      Object.entries(data).map(([k, v]) => [String(k), String(v)])
+    ) : undefined,
+    android: {
+      priority: 'high',
+    },
   };
 
-  const response = await admin.messaging().sendEachForMulticast(message);
+  const resp = await admin.messaging().sendEachForMulticast(message);
 
-  console.log('✅ Push sent:', response.successCount, '/', tokens.length);
-
-  return { success: response.successCount };
-}
-  const usersSnap = await db.collection('users')
-    .where(admin.firestore.FieldPath.documentId(), 'in', userIds)
-    .get();
-
-  let tokens = [];
-
-  usersSnap.forEach(doc => {
-    const data = doc.data() || {};
-    const fcmTokens = data.fcmTokens || {};
-    tokens.push(...Object.keys(fcmTokens));
-  });
-
-  if (tokens.length === 0) {
-    console.log('❌ No tokens found');
-    return { success: 0 };
-  }
-
-  const message = {
-    notification: { title, body },
-    tokens,
-  };
-
-  const response = await admin.messaging().sendEachForMulticast(message);
-
-  console.log('✅ Push sent:', response.successCount, '/', tokens.length);
-
-  return { success: response.successCount };
-}
-
-db.collection('notifications')
-  .where('sent', '==', false)
-  .onSnapshot(async snapshot => {
-    for (const change of snapshot.docChanges()) {
-      if (change.type !== 'added') continue;
-
-      const doc = change.doc;
-      const data = doc.data();
-
-      console.log('📨 New notification:', doc.id);
-
-      try {
-        const result = await sendPushToUsers(
-          data.toUserIds || [],
-          data.title || '',
-          data.body || ''
-        );
-
-        await doc.ref.update({
-          sent: true,
-          sentAt: admin.firestore.FieldValue.serverTimestamp(),
-          success: result.success
-        });
-
-      } catch (err) {
-        console.error('🔥 Push error:', err);
+  // remove invalid tokens (optional cleanup)
+  const invalidTokens = [];
+  resp.responses.forEach((r, idx) => {
+    if (!r.success) {
+      const code = r.error?.code || '';
+      if (
+        code === 'messaging/registration-token-not-registered' ||
+        code === 'messaging/invalid-registration-token'
+      ) {
+        invalidTokens.push(tokens[idx]);
       }
     }
   });
 
-console.log('👂 Listening for notifications...');
-const PORT = process.env.PORT || 10000;
-
-// 🔐 Простой ключ доступа для /send (задашь в Render Env)
-const API_KEY = (process.env.PUSH_API_KEY || "").trim();
-
-function loadServiceAccount() {
-  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64;
-  if (b64 && b64.trim().length > 0) {
-    const jsonText = Buffer.from(b64, "base64").toString("utf8");
-    return JSON.parse(jsonText);
-  }
-
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (raw && raw.trim().length > 0) return JSON.parse(raw);
-
-  throw new Error(
-    "Missing FIREBASE_SERVICE_ACCOUNT_JSON_B64 or FIREBASE_SERVICE_ACCOUNT_JSON"
-  );
-}
-
-const serviceAccount = loadServiceAccount();
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
-const db = admin.firestore();
-
-function chunk(arr, size) {
-  const res = [];
-  for (let i = 0; i < arr.length; i += size) res.push(arr.slice(i, i + size));
-  return res;
-}
-
-app.get("/", (req, res) => {
-  res.send(`Tutor Push Server v5 (project_id=${serviceAccount.project_id})`);
-});
-
-// ✅ Диагностика: список users
-app.get("/debug/users", async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit || "5", 10) || 5, 20);
-    const qs = await db.collection("users").limit(limit).get();
-
-    res.json({
-      ok: true,
-      project_id: serviceAccount.project_id,
-      count: qs.size,
-      ids: qs.docs.map((d) => d.id),
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// ✅ Диагностика: один user
-app.get("/debug/user/:uid", async (req, res) => {
-  try {
-    const uid = req.params.uid;
-    const snap = await db.collection("users").doc(uid).get();
-
-    if (!snap.exists) {
-      return res.json({
-        ok: true,
-        exists: false,
-        uid,
-        project_id: serviceAccount.project_id,
-      });
-    }
-
-    const data = snap.data() || {};
-    const fcmTokens =
-      data.fcmTokens && typeof data.fcmTokens === "object" ? data.fcmTokens : {};
-    const tokenKeys = Object.keys(fcmTokens);
-
-    res.json({
-      ok: true,
-      exists: true,
-      uid,
-      project_id: serviceAccount.project_id,
-      fcmTokensKeysCount: tokenKeys.length,
-      fcmTokensKeysFirst10: tokenKeys.slice(0, 10),
-      fcmTokensSample: tokenKeys
-        .slice(0, 3)
-        .map((k) => [k, typeof fcmTokens[k], fcmTokens[k]]),
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-async function sendToUserIds({ toUserIds, title, body, data }) {
-  const userRefs = toUserIds.map((uid) => db.collection("users").doc(uid));
-  const userSnaps = await db.getAll(...userRefs);
-
-  let tokens = [];
-  for (const us of userSnaps) {
-    if (!us.exists) continue;
-    const ud = us.data() || {};
-    const fcmTokens =
-      ud.fcmTokens && typeof ud.fcmTokens === "object" ? ud.fcmTokens : {};
-    tokens.push(...Object.keys(fcmTokens));
-  }
-
-  tokens = [...new Set(tokens)].filter(Boolean);
-
-  if (tokens.length === 0) {
-    return { ok: false, error: "no_tokens", tokens: 0 };
-  }
-
-  const payload = {
-    notification: {
-      title: String(title || "Уведомление"),
-      body: String(body || ""),
-    },
-    data: Object.fromEntries(
-      Object.entries(data || {}).map(([k, v]) => [String(k), String(v)])
-    ),
+  return {
+    ok: true,
+    requested: tokens.length,
+    successCount: resp.successCount,
+    failureCount: resp.failureCount,
+    invalidTokens,
   };
-
-  const batches = chunk(tokens, 500);
-  let success = 0;
-  let failure = 0;
-
-  for (const tks of batches) {
-    const r = await admin.messaging().sendEachForMulticast({
-      tokens: tks,
-      ...payload,
-    });
-    success += r.successCount;
-    failure += r.failureCount;
-  }
-
-  return { ok: true, tokens: tokens.length, success, failure };
 }
 
-// 🔐 middleware: проверка ключа
-function requireApiKey(req, res, next) {
-  if (!API_KEY) return next(); // если ключ не задан — не блокируем (на время теста)
-  const got = (req.header("x-api-key") || "").trim();
-  if (!got || got !== API_KEY) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-  next();
-}
+// -------------------------
+// Routes
+// -------------------------
+app.get('/', (req, res) => {
+  res.type('text/plain').send(`Tutor Push Server running v3 (project_id=${PROJECT_ID})`);
+});
 
-// ✅ Основной endpoint: Flutter будет дёргать его при действиях
-// POST /send  body: { toUserIds: ["uid"], title, body, data }
-app.post("/send", requireApiKey, async (req, res) => {
+app.get('/health', (req, res) => {
+  res.json({ ok: true, project_id: PROJECT_ID, admin_uids: ADMIN_UIDS.length });
+});
+
+// POST /send
+// Body: { toUserIds: ["uid1"], title:"...", body:"...", data:{...} }
+app.post('/send', async (req, res) => {
   try {
-    const toUserIds = Array.isArray(req.body?.toUserIds)
-      ? req.body.toUserIds
-      : [];
-    const title = req.body?.title || "Уведомление";
-    const body = req.body?.body || "";
-    const data =
-      req.body?.data && typeof req.body.data === "object" ? req.body.data : {};
-
-    if (toUserIds.length === 0) {
-      return res.status(400).json({ ok: false, error: "no_toUserIds" });
+    if (!checkApiKey(req)) {
+      return res.status(401).json({ ok: false, error: 'bad_api_key' });
     }
 
-    const result = await sendToUserIds({ toUserIds, title, body, data });
+    const { toUserIds, title, body, data } = req.body || {};
+    if (!Array.isArray(toUserIds) || toUserIds.length === 0) {
+      return res.status(400).json({ ok: false, error: 'toUserIds_required' });
+    }
+
+    const result = await sendPushToUsers(toUserIds, title, body, data);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    console.error('POST /send error:', e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-app.listen(PORT, () => console.log("Server started on port", PORT));
+// Debug: check if user doc exists + count tokens
+app.get('/debug/user/:uid', async (req, res) => {
+  try {
+    const uid = req.params.uid;
+    const doc = await db.collection('users').doc(uid).get();
+    const exists = doc.exists;
+    const data = doc.data() || {};
+    const fcmTokens = data.fcmTokens || {};
+    const tokenCount = Object.keys(fcmTokens).length;
+
+    res.json({
+      ok: true,
+      uid,
+      exists,
+      project_id: PROJECT_ID,
+      tokenCount,
+      tokenKeysPreview: Object.keys(fcmTokens).slice(0, 3),
+      updatedAt: data.updatedAt || null,
+    });
+  } catch (e) {
+    console.error('GET /debug/user/:uid error:', e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// Debug: list users (requires admin via query ?adminUid=UID)
+app.get('/debug/users', async (req, res) => {
+  try {
+    const adminUid = (req.query.adminUid || '').toString().trim();
+    if (!isAdminUid(adminUid)) {
+      return res.status(403).json({ ok: false, error: 'admin_only' });
+    }
+
+    const limit = Math.max(1, Math.min(50, parseInt(req.query.limit || '10', 10) || 10));
+    const snap = await db.collection('users').orderBy('updatedAt', 'desc').limit(limit).get();
+
+    const items = snap.docs.map((d) => {
+      const data = d.data() || {};
+      const fcmTokens = data.fcmTokens || {};
+      return {
+        uid: d.id,
+        tokenCount: Object.keys(fcmTokens).length,
+        updatedAt: data.updatedAt || null,
+      };
+    });
+
+    res.json({ ok: true, project_id: PROJECT_ID, count: items.length, items });
+  } catch (e) {
+    console.error('GET /debug/users error:', e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// -------------------------
+// Firestore listener: notifications
+// -------------------------
+function startNotificationsListener() {
+  console.log('👂 Listening for notifications...');
+
+  db.collection('notifications')
+    .where('sent', '==', false)
+    .onSnapshot(
+      async (snap) => {
+        if (snap.empty) return;
+
+        for (const doc of snap.docs) {
+          const notif = doc.data() || {};
+
+          // Expected schema:
+          // toUserIds: array<string>
+          // title: string
+          // body: string
+          // sent: false
+          const toUserIds = Array.isArray(notif.toUserIds) ? notif.toUserIds : Array.isArray(notif.toUserIds) ? notif.toUserIds : [];
+          const title = notif.title || 'Уведомление';
+          const body = notif.body || '';
+          const data = notif.data && typeof notif.data === 'object' ? notif.data : undefined;
+
+          console.log(`📨 New notification doc=${doc.id} toUserIds=${(toUserIds || []).length}`);
+
+          try {
+            // normalize: if user mistakenly created field "toUserIds" but named "toUserIds" ok.
+            // if someone uses "toUserIds" vs "toUserIds" etc — we only support toUserIds.
+            const ids = Array.isArray(notif.toUserIds) ? notif.toUserIds : [];
+            const result = await sendPushToUsers(ids, title, body, data);
+
+            await doc.ref.set(
+              {
+                sent: true,
+                sentAt: admin.firestore.FieldValue.serverTimestamp(),
+                result,
+              },
+              { merge: true }
+            );
+
+            console.log(`✅ Processed doc=${doc.id}`, result);
+          } catch (e) {
+            console.error(`❌ Failed doc=${doc.id}:`, e);
+            await doc.ref.set(
+              {
+                error: String(e.message || e),
+                lastErrorAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          }
+        }
+      },
+      (err) => {
+        console.error('🔥 Listener error:', err);
+      }
+    );
+}
+
+// -------------------------
+// Start server
+// -------------------------
+const PORT = parseInt(process.env.PORT || '10000', 10);
+
+app.listen(PORT, () => {
+  console.log(`Server started on port ${PORT}`);
+  console.log(`project_id=${PROJECT_ID}`);
+  console.log(`ADMIN_UIDS=${ADMIN_UIDS.join(',') || '(none)'}`);
+  startNotificationsListener();
+});
